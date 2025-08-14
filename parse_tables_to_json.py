@@ -272,6 +272,7 @@ def infer_header_depth_from_first_row(rows_spec) -> int:
     - 表の最初の行に出現する各セルの "前半のC/Tに付く数値"（= 行方向の連結数 / rowspan）の最大値を header depth とする
     - 例：最初の行に ＝C2_C1, ＝C1_C2, ＝C2_C1 があれば max(2,1,2)=2 行がヘッダー
     - セルがない/数値が取れない場合は 1 を返す（フォールバック）
+    - ヘッダーの次の行のA列が「分類」の場合、header depthを+1する
     
     Args:
         rows_spec: [[(val, rowspan, colspan, header_hint), ...], ...] 形式のリスト
@@ -297,7 +298,17 @@ def infer_header_depth_from_first_row(rows_spec) -> int:
             # 数値に変換できない場合はスキップ
             pass
     
-    return max_rs  # 少なくとも1行はヘッダー
+    # ヘッダーの次の行のA列が「分類」の場合、header depthを+1する
+    if len(rows_spec) > max_rs:
+        next_row = rows_spec[max_rs]
+        if next_row and len(next_row) > 0:
+            # A列（0番目のカラム）の値を取得
+            first_cell_value = next_row[0][0] if len(next_row[0]) > 0 else ""
+            # スペースを除去してから判定
+            if first_cell_value and "分類" in first_cell_value.replace(" ", "").replace("　", ""):
+                max_rs += 1
+    
+    return max_rs  # 少なくとも1行はヘッダー  # 少なくとも1行はヘッダー
 
 # ---------- テーブルパース ----------
 def parse_text_to_tables(text: str, keep_dividers: bool = False):
@@ -443,8 +454,9 @@ def table_to_json(tbl: Dict[str, Any],
         # 各論理カラムの値を抽出
         for col in logical_columns:
             if col.get("col_range"):  # 通常のデータカラム
+                # 結合セルの値を含むlabel_gridから値を取得
                 value = extract_value_from_range(
-                    grid_vals[r_idx], 
+                    label_grid[r_idx], 
                     col["col_range"], 
                     value_policy, 
                     concat_separator
