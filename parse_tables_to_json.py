@@ -316,6 +316,7 @@ def parse_text_to_tables(text: str, keep_dividers: bool = False):
     """
     テキストから本文と表を抽出する。
     組替え区切りタグで本文と図表を分離し、両方を保持する。
+    組替え区切りタグがない場合は本文なしで表のみ処理する。
     """
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     
@@ -353,7 +354,8 @@ def parse_text_to_tables(text: str, keep_dividers: bool = False):
         if separator_indices[0] + 1 < len(lines):
             table_text = '\n'.join(lines[separator_indices[0]+1:])
     else:
-        # 組替え区切りがない場合は全体を図表として扱う
+        # 組替え区切りがない場合は本文なしで全体を図表として扱う
+        body_text = ""  # 本文は空
         table_text = '\n'.join(lines)
     
     # 表の解析処理
