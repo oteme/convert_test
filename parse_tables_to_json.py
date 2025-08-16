@@ -30,6 +30,7 @@ JSON構造（例）:
 import sys
 import re
 import json
+import os
 from typing import List, Tuple, Dict, Any
 
 # ---------- 正規表現 ----------
@@ -313,10 +314,49 @@ def infer_header_depth_from_first_row(rows_spec) -> int:
 # ---------- テーブルパース ----------
 def parse_text_to_tables(text: str, keep_dividers: bool = False):
     """
-    テキストから表を抽出する。
-    区切り行（セルのない行）は既定でスキップ、keep_dividers=Trueで保持。
+    テキストから本文と表を抽出する。
+    組替え区切りタグで本文と図表を分離し、両方を保持する。
     """
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    
+    # 組替え区切りタグの位置を探す
+    separator_indices = []
+    for i, line in enumerate(lines):
+        if '<"組替え区切り">' in line:
+            separator_indices.append(i)
+    
+    # 本文と図表を分離
+    body_text = ""
+    table_text = ""
+    
+    if len(separator_indices) >= 2:
+        # 2つ目の組替え区切りまでが本文
+        body_lines = lines[:separator_indices[1]]
+        # 最初の組替え区切りまでの部分
+        if separator_indices[0] > 0:
+            first_part = '\n'.join(lines[:separator_indices[0]])
+        else:
+            first_part = ""
+        # 1つ目と2つ目の組替え区切りの間
+        if separator_indices[1] > separator_indices[0] + 1:
+            second_part = '\n'.join(lines[separator_indices[0]+1:separator_indices[1]])
+        else:
+            second_part = ""
+        body_text = (first_part + '\n' + second_part).strip()
+        # 2つ目の組替え区切り以降が図表
+        if separator_indices[1] + 1 < len(lines):
+            table_text = '\n'.join(lines[separator_indices[1]+1:])
+    elif len(separator_indices) == 1:
+        # 1つだけの場合は、その前が本文、後が図表
+        if separator_indices[0] > 0:
+            body_text = '\n'.join(lines[:separator_indices[0]])
+        if separator_indices[0] + 1 < len(lines):
+            table_text = '\n'.join(lines[separator_indices[0]+1:])
+    else:
+        # 組替え区切りがない場合は全体を図表として扱う
+        table_text = '\n'.join(lines)
+    
+    # 表の解析処理
     tables = []
     current_caption = None
     current_table = None
@@ -341,33 +381,38 @@ def parse_text_to_tables(text: str, keep_dividers: bool = False):
             tables.append(current_table)
             current_table = None
 
-    for ln in lines:
-        mcap = CAPTION_RE.match(ln)
-        if mcap:
-            current_caption = strip_inline_tags(mcap.group(1))
-            continue
+    # 図表部分の解析
+    if table_text:
+        table_lines = [ln.strip() for ln in table_text.splitlines() if ln.strip()]
+        for ln in table_lines:
+            mcap = CAPTION_RE.match(ln)
+            if mcap:
+                current_caption = strip_inline_tags(mcap.group(1))
+                continue
 
-        if TABLE_START_RE.match(ln):
-            flush_table()
-            table_id = ln[2:-2]  # <" と "> を剥がす
-            name = current_caption if (current_caption and '表' in current_caption) else table_id
-            current_table = {'id': table_id, 'name': sanitize_name(name), 'rows': []}
-            continue
+            if TABLE_START_RE.match(ln):
+                flush_table()
+                table_id = ln[2:-2]  # <" と "> を剥がす
+                name = current_caption if (current_caption and '表' in current_caption) else table_id
+                current_table = {'id': table_id, 'name': sanitize_name(name), 'rows': []}
+                continue
 
-        if ROW_RE.match(ln):
-            # 行区切り（<"行">, <"行_罫なし">, <"行_破線"> など）
-            flush_row()
-            continue
+            if ROW_RE.match(ln):
+                # 行区切り（<"行">, <"行_罫なし">, <"行_破線"> など）
+                flush_row()
+                continue
 
-        if CELL_RE.match(ln) and current_table is not None:
-            val, rs, cs, hdr = parse_cell_line(ln)
-            current_row.append((val, rs, cs, hdr))
-            continue
+            if CELL_RE.match(ln) and current_table is not None:
+                val, rs, cs, hdr = parse_cell_line(ln)
+                current_row.append((val, rs, cs, hdr))
+                continue
 
-        # 図の説明や注釈は今回は無視
+            # 図の説明や注釈は今回は無視
 
     flush_table()
-    return tables
+    
+    # 本文と表の両方を返す
+    return {'body_text': body_text, 'tables': tables}
 
 # ---------- JSON構築 ----------
 def table_to_json(tbl: Dict[str, Any], 
@@ -396,14 +441,14 @@ def table_to_json(tbl: Dict[str, Any],
     """
     rows_spec = tbl['rows']
     if not rows_spec:
-        return {"id": tbl['id'], "name": tbl['name'], "columns": [], "rows": []}
+        return {"id": tbl['id'], "name": tbl['name'], "headers": [], "columns": [], "rows": []}
     
     # 空行（区切り行）を除外してから処理（keep_dividers=Falseの場合）
     if not keep_dividers:
         rows_spec = [row for row in rows_spec if row]
     
     if not rows_spec:
-        return {"id": tbl['id'], "name": tbl['name'], "columns": [], "rows": []}
+        return {"id": tbl['id'], "name": tbl['name'], "headers": [], "columns": [], "rows": []}
     
     grid_vals, merges, top_lefts = place_cells_with_meta(rows_spec)
     
@@ -419,39 +464,29 @@ def table_to_json(tbl: Dict[str, Any],
     # 論理カラムの構築（連続同一パスを統合）
     logical_columns = build_logical_columns(label_grid, header_depth)
     
-    # 区分見出しの検出（add_classificationが有効な場合のみ処理）
+    # 区分見出しの検出
     class_spans = []
     if add_classification:
-        class_spans = detect_classification_spans(merges, label_grid, header_depth)
+        class_spans = detect_classification_spans(rows_spec, header_depth)
     
-    # フラットモードで分類列がある場合、先頭に分類カラムを追加
-    if class_spans and not nested_mode and add_classification:
-        # 分類カラムを先頭に挿入
-        logical_columns.insert(0, {
-            "path": [group_key],
-            "key": group_key,
-            "col_range": None  # 特別な列
-        })
+    # ヘッダー情報の生成
+    headers = []
+    for col in logical_columns:
+        if col.get("col_range"):  # 通常のデータカラム
+            headers.append(col["key"])
     
-    # データ行の処理
+    # データ行の構築
     data_rows = []
-    
-    for r_idx in range(header_depth, len(grid_vals)):
-        row_num = r_idx + 1  # 1-based
-        
-        # keep_dividersでかつ空行の場合
-        if keep_dividers and r_idx < len(rows_spec) and not rows_spec[r_idx]:
-            data_rows.append({"divider": True})
-            continue
-        
+    for r_idx in range(header_depth, len(label_grid)):
         row_obj = {}
         
-        # フラットモードで分類値を追加（add_classificationが有効な場合のみ）
-        if class_spans and not nested_mode and add_classification:
-            classification = get_classification_for_row(row_num, class_spans)
-            row_obj[group_key] = classification
+        # 区分見出しの追加
+        if add_classification:
+            classification = get_classification_for_row(r_idx + 1, class_spans)
+            if classification:
+                row_obj[group_key] = classification
         
-        # 各論理カラムの値を抽出
+        # 各論理カラムの値を取得
         for col in logical_columns:
             if col.get("col_range"):  # 通常のデータカラム
                 # 結合セルの値を含むlabel_gridから値を取得
@@ -473,13 +508,13 @@ def table_to_json(tbl: Dict[str, Any],
             for r_idx in range(span["r1"] - 1, span["r2"]):  # 0-based indexに変換
                 if r_idx - header_depth >= 0 and r_idx - header_depth < len(data_rows):
                     group_rows.append(data_rows[r_idx - header_depth])
-            if group_rows:
-                groups.append({
-                    "label": span["label"],
-                    "rows": group_rows
-                })
+            
+            groups.append({
+                "label": span["label"],
+                "rows": group_rows
+            })
         
-        # グループに属さない行も追加
+        # グループに属さない行を先頭に追加
         grouped_rows = set()
         for span in class_spans:
             for r in range(span["r1"], span["r2"] + 1):
@@ -497,6 +532,7 @@ def table_to_json(tbl: Dict[str, Any],
             "id": tbl['id'],
             "name": tbl['name'],
             "header_depth": header_depth,
+            "headers": headers,
             "columns": [{"path": col["path"], "key": col["key"]} for col in logical_columns 
                        if col.get("col_range")],  # 分類列を除外
             "groups": groups
@@ -507,6 +543,7 @@ def table_to_json(tbl: Dict[str, Any],
         "id": tbl['id'],
         "name": tbl['name'],
         "header_depth": header_depth,
+        "headers": headers,
         "columns": [{"path": col["path"], "key": col["key"]} for col in logical_columns],
         "rows": data_rows
     }
@@ -515,7 +552,7 @@ def main():
     import argparse
     
     # CLIパーサーの設定
-    parser = argparse.ArgumentParser(description='独自タグから表を復元し、階層ヘッダーつきJSONを出力')
+    parser = argparse.ArgumentParser(description='独自タグから本文と表を復元し、階層ヘッダーつきJSONを出力')
     parser.add_argument('input_file', help='入力テキストファイル')
     parser.add_argument('output_file', nargs='?', default='tables.json', help='出力JSONファイル（デフォルト: tables.json）')
     
@@ -557,12 +594,28 @@ def main():
     with open(args.input_file, "r", encoding="utf-8") as f:
         text = f.read()
 
-    # テーブルの解析（区切り行の扱いを指定）
-    parsed = parse_text_to_tables(text, keep_dividers=args.keep_dividers)
+    # テキストから本文と表を抽出（新しい関数が辞書を返す）
+    parsed_data = parse_text_to_tables(text, keep_dividers=args.keep_dividers)
     
-    # 各テーブルをJSON形式に変換
-    out = {"tables": []}
-    for tbl in parsed:
+    # 新しい出力形式を構築
+    output = {"documents": []}
+    
+    # 本文を追加（本文がある場合）
+    if parsed_data['body_text']:
+        body_doc = {
+            "type": "text",
+            "content": parsed_data['body_text'],
+            "metadata": {
+                "source": os.path.basename(args.input_file),
+                "doc_type": "body_text",
+                "file_path": args.input_file,
+                "section_index": 0
+            }
+        }
+        output["documents"].append(body_doc)
+    
+    # 各テーブルをJSON形式に変換して追加
+    for idx, tbl in enumerate(parsed_data['tables']):
         json_table = table_to_json(
             tbl, 
             manual_header_depth=manual_header_depth,
@@ -573,12 +626,30 @@ def main():
             keep_dividers=args.keep_dividers,
             add_classification=args.add_classification
         )
-        out["tables"].append(json_table)
+        
+        # テーブルドキュメントを構築
+        table_doc = {
+            "type": "table",
+            "content": {
+                "headers": json_table.get("headers", []),
+                "rows": json_table.get("rows", json_table.get("groups", []))
+            },
+            "metadata": {
+                "source": os.path.basename(args.input_file),
+                "doc_type": "table",
+                "file_path": args.input_file,
+                "table_index": idx,
+                "table_name": json_table.get("name", f"table_{idx}")
+            }
+        }
+        output["documents"].append(table_doc)
 
     with open(args.output_file, "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
+        json.dump(output, f, ensure_ascii=False, indent=2)
 
-    print(f"OK: wrote {args.output_file} with {len(out['tables'])} table(s).")
+    print(f"OK: wrote {args.output_file}")
+    print(f"  - 本文: {'あり' if parsed_data['body_text'] else 'なし'}")
+    print(f"  - テーブル数: {len(parsed_data['tables'])}")
     
     # オプション情報の表示
     if args.value_policy != 'first_nonempty':
